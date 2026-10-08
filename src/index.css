@@ -1,0 +1,223 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #fff;
+    color: #111827;
+    font-family: 'Cairo', Arial, sans-serif;
+  }
+  body {
+    min-height: 100vh;
+  }
+  button, input, select {
+    font: inherit;
+  }
+  button {
+    cursor: pointer;
+  }
+}
+
+@layer components {
+  .app-container {
+    width: min(100%, 430px);
+    min-height: 100vh;
+    margin: auto;
+    background: #fff;
+    padding: 13px 13px calc(88px + env(safe-area-inset-bottom));
+  }
+
+  /* Stretch the bottom nav's 4 items evenly so the outer gaps equal the inner gaps */
+  .bottom-nav-container > .flex {
+    width: 100%;
+    justify-content: space-evenly;
+  }
+}
+
+/* Bottom nav safe area */
+.bottom-nav-container {
+  position: fixed;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(100%, 430px);
+  padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+  background: rgba(255, 255, 255, 0.86);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-top: 1px solid #e8e9ee;
+  box-shadow: 0 -2px 12px rgba(16, 24, 40, 0.04);
+  z-index: 20;
+}
+
+/* Chevron rotation */
+.day-open .chevron-icon {
+  transform: rotate(180deg);
+}
+.chevron-icon {
+  transition: transform 0.2s;
+}
+
+/* Toast animation */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 94px;
+  transform: translate(-50%, 10px);
+  background: #111827;
+  color: #fff;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 12px;
+  opacity: 0;
+  pointer-events: none;
+  transition: 0.25s;
+  z-index: 100;
+  white-space: nowrap;
+}
+.toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+/* Bottom sheet overlay */
+.sheet-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(17, 24, 39, 0.35);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+  z-index: 50;
+}
+
+/* Fee section animations */
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes popIn {
+  from { transform: scale(0.5); }
+  to { transform: scale(1); }
+}
+
+/* Scrollbar hide for horizontal scroll */
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* ── UI polish ── */
+
+/* Bottom sheet: slide-up panel + fading overlay */
+@keyframes sheetUp {
+  from { transform: translate(-50%, 28px); opacity: 0.35; }
+  to { transform: translate(-50%, 0); opacity: 1; }
+}
+@keyframes overlayIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.sheet-overlay {
+  animation: overlayIn 0.18s ease;
+}
+.sheet-panel {
+  animation: sheetUp 0.26s cubic-bezier(0.22, 0.9, 0.28, 1);
+  box-shadow: 0 -10px 40px rgba(17, 24, 39, 0.22);
+}
+.sheet-handle {
+  width: 40px;
+  height: 4px;
+  border-radius: 99px;
+  background: #dfe3ea;
+  margin: 0 auto 6px;
+}
+
+/* Confirm dialog: keep the centering translate inside the keyframe */
+@keyframes dialogIn {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.92); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+.dialog-in {
+  animation: dialogIn 0.2s cubic-bezier(0.22, 0.9, 0.28, 1.05);
+}
+
+/* Loading skeletons */
+.skeleton {
+  background: linear-gradient(90deg, #f1f3f7 25%, #e8ebf2 37%, #f1f3f7 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.2s ease-in-out infinite;
+  border-radius: 12px;
+}
+@keyframes shimmer {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
+
+/* Tactile buttons: press feedback + visible keyboard focus */
+button {
+  transition: transform 0.12s ease, background-color 0.15s ease,
+    border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+button:active:not(:disabled) {
+  transform: scale(0.975);
+}
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid #6734ff;
+  outline-offset: 2px;
+}
+
+/* Thin, calm scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d7dcea;
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #b9bfd0;
+}
+
+/* Toast: long messages wrap instead of overflowing the screen */
+.toast {
+  white-space: normal;
+  max-width: min(92%, 400px);
+  text-align: center;
+  line-height: 1.6;
+  box-shadow: 0 8px 24px rgba(17, 24, 39, 0.25);
+}
+
+/* Number input without the up/down spinner arrows */
+.no-spinner::-webkit-outer-spin-button,
+.no-spinner::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.no-spinner {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* Respect users who ask for less motion */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
