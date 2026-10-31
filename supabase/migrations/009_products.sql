@@ -1,4 +1,4 @@
--- Product catalog: name + price + stock variants.
+-- Product catalog: name + price + photo + stock variants.
 --
 --   variants = [ { "color": "#f8e45c", "size": "M", "quantity": 3 }, ... ]
 --
@@ -16,12 +16,16 @@ CREATE TABLE IF NOT EXISTS products (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   name TEXT NOT NULL,
   price NUMERIC DEFAULT 0,
+  image_url TEXT,
   variants JSONB,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- ─── 2. Existing table → add the price the app auto-fills into orders ───
 ALTER TABLE products ADD COLUMN IF NOT EXISTS price NUMERIC DEFAULT 0;
+
+-- ─── 2b. Existing table → product photo key (R2), used by the stock manager ───
+ALTER TABLE products ADD COLUMN IF NOT EXISTS image_url TEXT;
 
 -- ─── 3. RLS — the anon key is public in the JS bundle, so the catalog must
 --        be locked to signed-in users (same policy as orders) ───

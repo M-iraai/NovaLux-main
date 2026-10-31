@@ -1,14 +1,17 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { supabase } from '../lib/supabase'
 import {
-  ChevronDown, Trash2, Plus, Search,
-  ShoppingCart, X, Pencil, Phone, MapPin, Ruler, ImageIcon, Download
+  ChevronDown, Trash2, Plus, Search, SearchX,
+  ShoppingCart, X, Pencil, Phone, MapPin, Ruler, ImageIcon, Download,
+  Check, Package, ShoppingBag, Home, Building2, Clock
 } from 'lucide-react'
 import BottomSheet from './BottomSheet'
 import LazyImage from './LazyImage'
 import ConfirmDialog from './ConfirmDialog'
 import { useDebounce } from '../hooks/useDebounce'
 import { compressImage } from '../utils/compressImage'
+import stockManager from '../utils/stockManager'
+import { productColors, productSizes } from '../utils/variants'
 
 // image_url in DB is the R2 key (e.g. products/123-abc.png)
 function getImageUrl(storedValue) {
@@ -215,6 +218,7 @@ const emptyItem = () => ({
   imageKey: null,
   productId: null,
   productName: '',
+  price: '',
   color: '',
   size: '',
 })
@@ -262,6 +266,7 @@ function orderProducts(order) {
       size: p?.size || '',
       productId: p?.product_id || null,
       productName: p?.product_name || '',
+      price: p?.price != null ? Number(p.price) : null,
     }))
   }
   return [{
@@ -270,6 +275,7 @@ function orderProducts(order) {
     size: order.size || '',
     productId: null,
     productName: '',
+    price: order.product_price != null ? Number(order.product_price) : null,
   }]
 }
 
@@ -311,63 +317,10 @@ const formatEcotrackErrors = (data) => {
   return 'خطأ في ECOTRACK'
 }
 
-// Subtract ordered quantities from catalog stock. For each order item that
-// references a catalog product (via product_id + matching colour/size variant),
-// decrement that variant's quantity in the products.variants array.
-// Failures are non-fatal — the order is already saved — so errors just produce
-// a warning toast and the order survives.
-async function subtractOrderStock(products, catalog, showToast) {
-  try {
-    // DEBUG: trace what we got
-    console.log('[subtractOrderStock] order products:', JSON.stringify(products?.map(p => ({ product_id: p.product_id, color: p.color, size: p.size })), null, 2))
-    console.log('[subtractOrderStock] catalog:', JSON.stringify((catalog || []).map(c => ({ id: c.id, name: c.name, variants: c.variants })), null, 2))
-
-    // Count how many of each (product_id, color, size) were ordered
-    const byProduct = new Map() // productId -> [{ color, size, count }]
-    for (const p of products || []) {
-      if (!p?.product_id || !p.color || !p.size) continue
-      if (!byProduct.has(p.product_id)) byProduct.set(p.product_id, [])
-      const arr = byProduct.get(p.product_id)
-      const existing = arr.find(e => e.color === p.color && e.size === p.size)
-      if (existing) existing.count += 1
-      else arr.push({ color: p.color, size: p.size, count: 1 })
-    }
-    if (byProduct.size === 0) return
-
-    for (const [pid, entries] of byProduct) {
-      const product = (catalog || []).find(c => String(c.id) === String(pid))
-      if (!product) {
-        console.log('[subtractOrderStock] product NOT found in catalog for pid:', pid)
-        continue
-      }
-      const variants = Array.isArray(product.variants) ? product.variants : []
-      if (!variants.length) continue
-
-      console.log('[subtractOrderStock] matching product:', product.name, 'pid:', pid)
-      console.log('[subtractOrderStock] entries to match:', JSON.stringify(entries))
-      console.log('[subtractOrderStock] catalog variants:', JSON.stringify(variants))
-
-      const updated = variants.map(v => {
-        const entry = entries.find(e => e.color === v.color && e.size === v.size)
-        if (entry) {
-          console.log('[subtractOrderStock] MATCH found! color:', v.color, 'size:', v.size, 'oldQty:', v.quantity, 'count:', entry.count)
-          return { ...v, quantity: Math.max(0, (Number(v.quantity) || 0) - entry.count) }
-        }
-        console.log('[subtractOrderStock] no match for variant:', JSON.stringify(v))
-        return v
-      })
-
-      const { error } = await supabase.from('products').update({ variants: updated }).eq('id', pid)
-      if (error) {
-        console.log('[subtractOrderStock] UPDATE ERROR:', error)
-        showToast(`تعذر تحديث المخزون للمنتج \"${product.name}\": ${error.message}`)
-      } else {
-        console.log('[subtractOrderStock] UPDATE SUCCESS for product:', product.name)
-      }
-    }
-  } catch (err) {
-    console.error('subtractOrderStock:', err)
-  }
+// Subtract ordered quantities from catalog stock using stock manager
+// @see stockManager.subtractStock
+function subtractOrderStock(products, catalog, showToast) {
+  stockManager.subtractStock(products, catalog, showToast)
 }
 
 // One call to our /api/orders proxy → { ok, data, tracking, error }
@@ -405,6 +358,24 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
   const [feesData, setFeesData] = useState(null)
   const [triedSubmit, setTriedSubmit] = useState(false)
   const debouncedSearch = useDebounce(searchQuery, 300)
+
+  // "اسم المنتج" mirrors the picked catalog products: "A + B + C".
+  // Only what we auto-fill is cleared, so manual text is never wiped.
+  const pickedProductNames = [...new Set(items.map(i => i.productName).filter(Boolean))]
+  const pickedProductsLabel = pickedProductNames.join(' + ')
+  const lastAutoProduit = useRef('')
+
+  useEffect(() => {
+    if (!pickedProductsLabel) {
+      if (lastAutoProduit.current) {
+        setCustomer(prev => prev.produit === lastAutoProduit.current ? { ...prev, produit: '' } : prev)
+        lastAutoProduit.current = ''
+      }
+      return
+    }
+    lastAutoProduit.current = pickedProductsLabel
+    setCustomer(prev => prev.produit === pickedProductsLabel ? prev : { ...prev, produit: pickedProductsLabel })
+  }, [pickedProductsLabel])
 
   useEffect(() => {
     fetch('/api/fees')
@@ -470,16 +441,21 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
     return Number(deliveryType === 'desk' ? f.tarif_stopdesk : f.tarif) || 0
   }
   const deliveryFee = feeFor(customer.code_wilaya, customer.delivery_type)
-  // The unit price is multiplied by the number of products in the order
-  const productCount = Math.max(1, items.length)
-  const productPrice = Number(customer.product_price) || 0
-  const totalMontant = productPrice * productCount + deliveryFee
+  // Every product carries its own price (auto-filled from the catalog when
+  // picked). Manual items without a price fall back to the default unit price,
+  // so the order total is always the sum of the products + delivery.
+  const defaultUnitPrice = Number(customer.product_price) || 0
+  const unitPriceOf = (item) => {
+    const own = Number(item?.price)
+    return own > 0 ? own : defaultUnitPrice
+  }
+  const itemsTotal = items.reduce((sum, it) => sum + unitPriceOf(it), 0)
+  const totalMontant = itemsTotal + deliveryFee
 
   const phoneInvalid = triedSubmit && !/^\d{9,10}$/.test(customer.phone.trim())
   const addressInvalid = triedSubmit && !customer.address.trim()
   const wilayaInvalid = triedSubmit && !customer.code_wilaya
   const communeInvalid = triedSubmit && !customer.commune.trim()
-  const montantInvalid = triedSubmit && (!customer.product_price || Number(customer.product_price) <= 0)
 
   // One input style for the whole add/edit form, so the sheet reads as a single
   // tidy form instead of two stacked forms with different heights.
@@ -502,6 +478,14 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
 
   const allDayGroups = useMemo(() => groupOrdersByDay(filteredOrders), [filteredOrders])
   const dayGroups = useMemo(() => allDayGroups.slice(0, showCount), [allDayGroups, showCount])
+
+  const statusCounts = useMemo(() => ({
+    all: orders.length,
+    confirmed: orders.filter(o => o.confirmed).length,
+    unconfirmed: orders.filter(o => !o.confirmed).length,
+  }), [orders])
+  const filtersActive = !!debouncedSearch.trim() || statusFilter !== 'all'
+  const resetFilters = () => { setSearchQuery(''); setStatusFilter('all') }
 
 
   const toggleDay = (key) => {
@@ -534,6 +518,7 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
       imageKey: p.image || null,
       productId: p.productId || null,
       productName: p.productName || '',
+      price: p.price != null && Number(p.price) > 0 ? String(p.price) : '',
       color: p.color || '',
       size: p.size || '',
     })))
@@ -560,25 +545,87 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
   }
 
   const addItem = () => setItems(prev => [...prev, emptyItem()])
-  const removeItem = (itemId) => setItems(prev => prev.length > 1 ? prev.filter(i => i.id !== itemId) : prev)
+
+  // Blob previews are revoked whenever they are replaced or dropped.
+  const revokePreview = (preview) => {
+    if (preview && String(preview).startsWith('blob:')) URL.revokeObjectURL(preview)
+  }
+
+  const removeItem = (itemId) => setItems(prev => {
+    if (prev.length <= 1) return prev
+    revokePreview(prev.find(i => i.id === itemId)?.imagePreview)
+    return prev.filter(i => i.id !== itemId)
+  })
+
   const updateItem = (itemId, field, value) => {
     setItems(prev => prev.map(i => i.id === itemId ? { ...i, [field]: value } : i))
   }
 
   const handleItemImage = (itemId, e) => {
     const file = e.target.files?.[0]
-    if (file) {
-      updateItem(itemId, 'imageFile', file)
-      updateItem(itemId, 'imagePreview', URL.createObjectURL(file))
-    }
+    e.target.value = ''
+    if (!file) return
+    setItems(prev => prev.map(i => {
+      if (i.id !== itemId) return i
+      revokePreview(i.imagePreview)
+      return { ...i, imageFile: file, imagePreview: URL.createObjectURL(file) }
+    }))
   }
 
   const removeItemImage = (itemId) => {
-    updateItem(itemId, 'imageFile', null)
-    updateItem(itemId, 'imagePreview', null)
+    setItems(prev => prev.map(i => {
+      if (i.id !== itemId) return i
+      revokePreview(i.imagePreview)
+      return { ...i, imageFile: null, imagePreview: null }
+    }))
   }
 
   const productById = (id) => (id ? catalog.find(p => String(p.id) === String(id)) || null : null)
+
+  // Available quantity for one colour/size pair of a catalog product.
+  const stockQty = (product, color, size) => {
+    const variant = (product?.variants || []).find(v => v?.color === color && v?.size === size)
+    return Number(variant?.quantity) || 0
+  }
+
+  // Link an order item to a stock product: resets colour/size, borrows the
+  // catalog photo and pre-fills the empty ECOTRACK name/price fields.
+  const handleItemProduct = (itemId, productId) => {
+    const p = productById(productId)
+    setItems(prev => prev.map(it => {
+      if (it.id !== itemId) return it
+      // Keep a photo the user uploaded themselves. Otherwise show the catalog
+      // photo as a preview only — never store its key on the order, so deleting
+      // the order can't delete the stock product's photo from R2.
+      const hasOwnPhoto = !!it.imageFile
+      return {
+        ...it,
+        productId: p?.id || null,
+        productName: p?.name || '',
+        price: p && Number(p.price) > 0 ? String(p.price) : '',
+        color: '',
+        size: '',
+        imagePreview: hasOwnPhoto ? it.imagePreview : (p?.image_url ? getImageUrl(p.image_url) : null),
+        imageKey: hasOwnPhoto ? it.imageKey : null,
+      }
+    }))
+    if (p) {
+      setCustomer(prev => ({
+        ...prev,
+        product_price: prev.product_price ? prev.product_price : (Number(p.price) > 0 ? String(p.price) : prev.product_price),
+      }))
+    }
+  }
+
+  // Changing colour keeps the size only when that size still exists.
+  const handleItemColor = (itemId, color) => {
+    setItems(prev => prev.map(it => {
+      if (it.id !== itemId) return it
+      const p = productById(it.productId)
+      const sizes = productSizes(p?.variants, color)
+      return { ...it, color, size: sizes.includes(it.size) ? it.size : '' }
+    }))
+  }
 
   const buildEcotrackPayload = () => ({
     type: Number(customer.order_type) || 1,
@@ -599,6 +646,26 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
     setTriedSubmit(true)
     if (!customer.customer_name.trim() || !customer.phone.trim()) return
 
+    // Never sell more than a linked catalog product actually has (add flow
+    // only — editing an order must not re-check stock it already consumed).
+    if (!editingOrder) {
+      const requested = new Map()
+      for (const it of items) {
+        if (!it.productId || !it.color || !it.size) continue
+        const key = `${it.productId}|${it.color}|${it.size}`
+        requested.set(key, (requested.get(key) || 0) + 1)
+      }
+      for (const [key, count] of requested) {
+        const [pid, color, size] = key.split('|')
+        const product = productById(pid)
+        const available = stockQty(product, color, size)
+        if (count > available) {
+          showToast(`الكمية المطلوبة من "${product?.name || 'منتج'}" — ${size} أكبر من المخزون (${available})`)
+          return
+        }
+      }
+    }
+
     // Everything that reaches ECOTRACK needs complete shipping data
     const goesToEcotrack = !editingOrder || !!editingOrder.tracking
     if (goesToEcotrack) {
@@ -607,7 +674,7 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
       if (!customer.address.trim()) missing.push('العنوان')
       if (!customer.code_wilaya) missing.push('الولاية')
       if (!customer.commune.trim()) missing.push('البلدية')
-      if (!customer.product_price || Number(customer.product_price) <= 0) missing.push('سعر المنتج')
+      if (itemsTotal <= 0) missing.push('سعر المنتج في قائمة المنتجات')
       if (missing.length) {
         showToast(`أكمل الحقول: ${missing.join('، ')}`)
         return
@@ -626,7 +693,7 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
       commune: customer.commune.trim(),
       code_postal: customer.code_postal,
       montant: totalMontant,
-      product_price: Number(customer.product_price) || 0,
+      product_price: defaultUnitPrice || unitPriceOf(items[0]) || 0,
       produit: customer.produit.trim(),
       order_type: Number(customer.order_type) || 1,
       image_url: imageUrl,
@@ -667,6 +734,7 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
             size: item.size.trim(),
             product_id: item.productId || null,
             product_name: item.productName || '',
+            price: unitPriceOf(item) || 0,
           })
         }
 
@@ -732,6 +800,7 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
             size: item.size.trim(),
             product_id: item.productId || null,
             product_name: item.productName || '',
+            price: unitPriceOf(item) || 0,
           })
         }
 
@@ -807,48 +876,12 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
     setSaving(false)
   }
 
-  // Opposite of subtractOrderStock: add back the exact quantities an order
-  // took from the catalog. For each order item that references a catalog
-  // product (product_id + matching colour/size variant), increment that
-  // variant's quantity.
-  async function addBackOrderStock(products, catalog, showToast) {
-    try {
-      const byProduct = new Map() // productId -> [{ color, size, count }]
-      for (const p of products || []) {
-        // orderProducts() returns camelCase productId; raw rows use product_id
-        const pid = p?.product_id || p?.productId
-        if (!pid || !p.color || !p.size) continue
-        if (!byProduct.has(pid)) byProduct.set(pid, [])
-        const arr = byProduct.get(pid)
-        const existing = arr.find(e => e.color === p.color && e.size === p.size)
-        if (existing) existing.count += 1
-        else arr.push({ color: p.color, size: p.size, count: 1 })
-      }
-      if (byProduct.size === 0) return
-
-      for (const [pid, entries] of byProduct) {
-        const product = (catalog || []).find(c => String(c.id) === String(pid))
-        if (!product) continue
-        const variants = Array.isArray(product.variants) ? product.variants : []
-        if (!variants.length) continue
-
-        const updated = variants.map(v => {
-          const entry = entries.find(e => e.color === v.color && e.size === v.size)
-          if (entry) {
-            return { ...v, quantity: (Number(v.quantity) || 0) + entry.count }
-          }
-          return v
-        })
-
-        const { error } = await supabase.from('products').update({ variants: updated }).eq('id', pid)
-        if (error) {
-          showToast(`تعذر عودة المخزون للمنتج \"${product.name}\": ${error.message}`)
-        }
-      }
-    } catch (err) {
-      console.error('addBackOrderStock:', err)
-    }
+  // Add back the exact quantities an order took from the catalog using stock manager
+// @see stockManager.addStock
+function addBackOrderStock(products, catalog, showToast) {
+  stockManager.addStock(products, catalog, showToast)
   }
+
 
   const handleDeleteOrder = (order) => {
     setConfirmDialog({
@@ -1030,36 +1063,75 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
       {full && (
         <div className="relative mb-3">
           <input
-            type="text"
+            type="search"
+            inputMode="search"
             placeholder="ابحث عن اسم أو رقم هاتف..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full h-12 border border-border rounded-xl px-4 pl-10 outline-none focus:border-purple focus:ring-2 focus:ring-purple/10 transition-all text-sm bg-white"
+            className="w-full h-12 border border-border rounded-xl px-10 outline-none focus:border-purple focus:ring-2 focus:ring-purple/10 transition-all text-sm bg-white appearance-none"
           />
-          <Search size={18} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-muted" />
+          <Search size={18} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-muted pointer-events-none" />
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery('')}
+              aria-label="مسح البحث"
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 w-7 h-7 rounded-full bg-soft border-0 text-muted grid place-items-center hover:bg-lav hover:text-purple transition-colors"
+            >
+              <X size={14} />
+            </button>
+          )}
         </div>
       )}
 
       {/* Status Filter */}
       {full && (
-        <div className="flex gap-2 mb-4">
+        <div className="flex gap-2 mb-3" role="tablist">
           {[
-            { id: 'all', label: 'الكل' },
-            { id: 'unconfirmed', label: 'غير مؤكد' },
-            { id: 'confirmed', label: 'مؤكد' },
-          ].map((f) => (
-            <button
-              key={f.id}
-              onClick={() => setStatusFilter(f.id)}
-              className={`h-8 px-4 rounded-full border text-xs font-bold transition-all ${
-                statusFilter === f.id
-                  ? 'bg-purple text-white border-purple shadow-sm'
-                  : 'bg-white text-muted border-border hover:border-purple/40'
-              }`}
-            >
-              {f.label}
-            </button>
-          ))}
+            { id: 'all', label: 'الكل', count: statusCounts.all },
+            { id: 'unconfirmed', label: 'غير مؤكد', count: statusCounts.unconfirmed },
+            { id: 'confirmed', label: 'مؤكد', count: statusCounts.confirmed },
+          ].map((f) => {
+            const active = statusFilter === f.id
+            return (
+              <button
+                key={f.id}
+                role="tab"
+                aria-selected={active}
+                onClick={() => setStatusFilter(f.id)}
+                className={`h-9 px-3.5 rounded-full border text-xs font-extrabold flex items-center gap-1.5 transition-all ${
+                  active
+                    ? 'bg-purple text-white border-purple shadow-sm shadow-purple/20'
+                    : 'bg-white text-muted border-border hover:border-purple/40 hover:text-purple'
+                }`}
+              >
+                <span>{f.label}</span>
+                <span
+                  className={`min-w-[18px] h-[18px] px-1 rounded-full grid place-items-center text-[10px] tabular-nums ${
+                    active ? 'bg-white/25 text-white' : 'bg-lav text-purple'
+                  }`}
+                >
+                  {f.count}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      {/* Active filters summary */}
+      {full && filtersActive && filteredOrders.length > 0 && (
+        <div className="flex items-center justify-between mb-3 px-1" dir="rtl">
+          <span className="text-[11px] font-semibold text-subtle">
+            {filteredOrders.length} نتيجة من أصل {statusCounts.all} طلب
+          </span>
+          <button
+            type="button"
+            onClick={resetFilters}
+            className="text-[11px] font-extrabold text-purple bg-transparent border-0 p-0 hover:underline"
+          >
+            مسح الفلاتر
+          </button>
         </div>
       )}
 
@@ -1106,7 +1178,10 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
               <div className="mt-2 space-y-2.5 pr-1" dir="rtl">
                 {group.orders.map((order) => {
                   const prods = orderProducts(order)
-                  const mainImage = prods[0]?.image || null
+                  // Orders don't own the catalog photo — fall back to the linked
+                  // product's photo for display instead of storing/deleting it.
+                  const linkedImage = prods[0]?.productId ? productById(prods[0].productId)?.image_url : null
+                  const mainImage = prods[0]?.image || linkedImage || null
                   return (
                   <div
                     key={order.id}
@@ -1151,41 +1226,50 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
                             <button
                               onClick={() => handleConfirmOrder(order)}
                               disabled={confirming === order.id}
-                              className={`w-8 h-8 rounded-full border-2 flex items-center justify-center transition-all duration-200 disabled:opacity-50 ${
+                              aria-pressed={!!order.confirmed}
+                              className={`h-8 rounded-full border-2 px-2.5 flex items-center justify-center gap-1 text-[11px] font-extrabold transition-all duration-200 disabled:opacity-60 active:scale-95 ${
                                 order.confirmed
-                                  ? 'bg-green-500 border-green-500 text-white'
-                                  : 'bg-white border-gray-300 text-gray-300 hover:border-green-400 hover:text-green-400'
+                                  ? 'bg-green-500 border-green-500 text-white hover:bg-green-600 hover:border-green-600'
+                                  : 'bg-white border-border7 text-muted hover:border-green-400 hover:text-green-600 hover:bg-green-50'
                               }`}
                               title={order.confirmed ? 'إلغاء تأكيد الطلب' : 'تأكيد الطلب'}
                             >
                               {confirming === order.id ? (
-                                <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                                <span className="w-3.5 h-3.5 border-2 border-current border-t-transparent rounded-full animate-spin" />
                               ) : (
-                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                                </svg>
+                                <Check size={13} strokeWidth={3} />
                               )}
+                              <span>{order.confirmed ? 'مؤكد' : 'تأكيد'}</span>
                             </button>
                             {full && (
                               <button
                                 onClick={() => openEditOrder(order)}
-                                className="w-7 h-7 rounded-lg bg-lav text-purple grid place-items-center border-0 hover:bg-purple/15 transition-colors"
+                                aria-label="تعديل الطلب"
+                                title="تعديل الطلب"
+                                className="w-8 h-8 rounded-lg bg-lav text-purple grid place-items-center border-0 hover:bg-purple/15 active:scale-95 transition-all"
                               >
-                                <Pencil size={13} />
+                                <Pencil size={14} />
                               </button>
                             )}
                             <button
                               onClick={() => handleDeleteOrder(order)}
-                              className="w-7 h-7 rounded-lg bg-red-50 text-danger grid place-items-center border-0 hover:bg-red-100 transition-colors"
+                              aria-label="حذف الطلب"
+                              title="حذف الطلب"
+                              className="w-8 h-8 rounded-lg bg-red-50 text-danger grid place-items-center border-0 hover:bg-red-100 active:scale-95 transition-all"
                             >
-                              <Trash2 size={13} />
+                              <Trash2 size={14} />
                             </button>
                           </div>
                         </div>
                         <div className="flex items-center gap-1.5 mt-1 text-meta2 text-xs">
-                          <Phone size={11} />
-
-                          <span dir="ltr">{order.phone}</span>
+                          <Phone size={11} className="shrink-0 text-subtle" />
+                          <a
+                            href={`tel:${order.phone}`}
+                            dir="ltr"
+                            className="text-ink font-semibold no-underline hover:text-purple transition-colors"
+                          >
+                            {order.phone}
+                          </a>
                         </div>
 
                       {order.address && (
@@ -1195,49 +1279,53 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
                         </div>
                       )}
                           {/* Tags */}
-                          <div className="flex flex-wrap gap-1.5 mt-2">
+                          <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                            {Number(order.montant) > 0 && (
+                              <span className="inline-flex items-center gap-1 bg-emerald-50 border border-emerald-200 rounded-full px-2 py-1 text-[10px] font-extrabold text-emerald-700 tabular-nums">
+                                {Number(order.montant).toLocaleString('en-US')} دج
+                              </span>
+                            )}
                             {order.tracking && (
-                              <span className="inline-flex items-center gap-1 border rounded-full px-2 py-0.5 text-[10px] font-semibold bg-lav border-purple/30 text-purple" dir="ltr">
-                                📦 {order.tracking}
+                              <span className="inline-flex items-center gap-1 border rounded-full px-2 py-1 text-[10px] font-semibold bg-lav border-purple/30 text-purple" dir="ltr">
+                                <Package size={10} />
+                                {order.tracking}
                               </span>
                             )}
                             {prods.length <= 1 && [...new Set(prods.map(p => p.productName).filter(Boolean))].map(name => (
-                              <span key={name} className="inline-flex items-center gap-1 bg-lav border border-purple/30 rounded-full px-2 py-0.5 text-[10px] font-semibold text-purple">
-                                🛍 {name}
+                              <span key={name} className="inline-flex items-center gap-1 bg-lav border border-purple/30 rounded-full px-2 py-1 text-[10px] font-semibold text-purple truncate max-w-[160px]">
+                                <ShoppingBag size={10} className="shrink-0" />
+                                <span className="truncate">{name}</span>
                               </span>
                             ))}
-                            {order.wilaya_name && (
-                              <span className="inline-flex items-center gap-1 bg-soft border border-border rounded-full px-2 py-0.5 text-[10px] font-semibold text-meta2">
-                                📍 {order.wilaya_name}{order.commune ? ` / ${order.commune}` : ''}
-                              </span>
-                            )}
-                            {Number(order.montant) > 0 && (
-                              <span className="inline-flex items-center gap-1 bg-green-50 border border-green-200 rounded-full px-2 py-0.5 text-[10px] font-semibold text-green-700">
-                                {Number(order.montant)} دج
-                              </span>
-                            )}
                             {order.delivery_type && (
-                              <span className={`inline-flex items-center gap-1 border rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                              <span className={`inline-flex items-center gap-1 border rounded-full px-2 py-1 text-[10px] font-semibold ${
                                 order.delivery_type === 'home'
                                   ? 'bg-blue-50 border-blue-200 text-blue-600'
                                   : 'bg-amber-50 border-amber-200 text-amber-600'
                               }`}>
-                                {order.delivery_type === 'home' ? '🏠' : '🏢'}
+                                {order.delivery_type === 'home' ? <Home size={10} /> : <Building2 size={10} />}
                                 {order.delivery_type === 'home' ? 'المنزل' : 'المكتب'}
                               </span>
                             )}
+                            {order.wilaya_name && (
+                              <span className="inline-flex items-center gap-1 bg-soft border border-border rounded-full px-2 py-1 text-[10px] font-semibold text-meta2">
+                                <MapPin size={10} className="shrink-0" />
+                                {order.wilaya_name}{order.commune ? ` / ${order.commune}` : ''}
+                              </span>
+                            )}
                             {prods.length <= 1 && [...new Set(prods.map(p => p.color).filter(Boolean))].map(color => (
-                              <span key={color} className="inline-flex items-center bg-white border border-border rounded-full px-2 py-0.5 text-[10px] font-semibold text-meta2">
-                                {color}
+                              <span key={color} aria-label="اللون" className="inline-flex items-center bg-white border border-border rounded-full p-1">
+                                <span className="w-3.5 h-3.5 rounded-full border border-black/10" style={{ background: color }} />
                               </span>
                             ))}
                             {prods.length <= 1 && [...new Set(prods.map(p => p.size).filter(Boolean))].map(size => (
-                              <span key={size} className="inline-flex items-center gap-1 bg-soft border border-border rounded-full px-2 py-0.5 text-[10px] font-semibold text-meta2">
+                              <span key={size} className="inline-flex items-center gap-1 bg-soft border border-border rounded-full px-2 py-1 text-[10px] font-semibold text-meta2">
                                 <Ruler size={9} />
                                 {size}
                               </span>
                             ))}
-                            <span className="text-[10px] text-subtle font-medium">
+                            <span className="inline-flex items-center gap-1 text-[10px] text-subtle font-medium">
+                              <Clock size={9} className="text-muted" />
                               {formatTime(new Date(order.created_at))}
                             </span>
                           </div>
@@ -1249,9 +1337,9 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
                       <div className="mt-2.5 pt-2.5 border-t border-dashed border-border space-y-1.5">
                         {prods.map((p, pi) => (
                           <div key={pi} className="flex items-center gap-2 rounded-xl bg-soft/60 border border-border px-2.5 py-2">
-                            <div className="w-7 h-7 shrink-0 rounded-md border border-border bg-white overflow-hidden">
+                            <div className="relative w-7 h-7 shrink-0 rounded-md border border-border bg-white overflow-hidden">
                               <LazyImage
-                                src={p.image ? getImageUrl(p.image) : null}
+                                src={p.image ? getImageUrl(p.image) : (p.productId ? getImageUrl(productById(p.productId)?.image_url) : null)}
                                 className="w-full h-full object-cover"
                                 fallback={
                                   <div className="w-full h-full grid place-items-center text-muted bg-white">
@@ -1259,13 +1347,23 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
                                   </div>
                                 }
                               />
+                              {p.image && (
+                                <button
+                                  type="button"
+                                  onClick={() => downloadImage(getImageUrl(p.image), p.image.split('/').pop(), p.size, p.color)}
+                                  className="absolute bottom-0.5 right-0.5 w-4 h-4 rounded bg-black/60 text-white grid place-items-center border-0 hover:bg-black/80 transition-colors"
+                                  title="تحميل الصورة"
+                                >
+                                  <Download size={9} />
+                                </button>
+                              )}
                             </div>
                             <span className="flex-1 min-w-0 text-[11px] font-bold text-ink truncate">
                               {p.productName}
                             </span>
                             {p.color && (
-                              <span className="shrink-0 rounded-full bg-white border border-border px-2 py-0.5 text-[10px] font-semibold text-meta2">
-                                {p.color}
+                              <span aria-label="اللون" className="shrink-0 rounded-full bg-white border border-border p-1 grid place-items-center">
+                                <span className="w-3 h-3 rounded-full border border-black/10" style={{ background: p.color }} />
                               </span>
                             )}
                             {p.size && (
@@ -1297,13 +1395,30 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
       )}
 
       {dayGroups.length === 0 && (
-        <div className="text-center py-16 text-muted">
-          <div className="w-20 h-20 rounded-full bg-lav mx-auto mb-4 grid place-items-center">
-            <ShoppingCart size={32} className="text-purple" />
+        filtersActive ? (
+          <div className="text-center py-14">
+            <div className="w-20 h-20 rounded-full bg-soft border border-border mx-auto mb-4 grid place-items-center">
+              <SearchX size={30} className="text-muted" strokeWidth={1.6} />
+            </div>
+            <p className="font-bold text-ink text-base">لا توجد نتائج مطابقة</p>
+            <p className="text-sm mt-1 text-subtle">جرّب اسماً أو رقماً آخر، أو أعد ضبط البحث والفلاتر.</p>
+            <button
+              type="button"
+              onClick={resetFilters}
+              className="mt-4 h-9 px-4 rounded-xl border border-border bg-white text-purple text-xs font-extrabold hover:bg-lav transition-colors"
+            >
+              مسح البحث والفلاتر
+            </button>
           </div>
-          <p className="font-bold text-ink text-base">لا توجد طلبات بعد</p>
-          <p className="text-sm mt-1 text-subtle">أضف أول طلب للبدء</p>
-        </div>
+        ) : (
+          <div className="text-center py-16 text-muted">
+            <div className="w-20 h-20 rounded-full bg-lav mx-auto mb-4 grid place-items-center">
+              <ShoppingCart size={32} className="text-purple" />
+            </div>
+            <p className="font-bold text-ink text-base">لا توجد طلبات بعد</p>
+            <p className="text-sm mt-1 text-subtle">أضف أول طلب للبدء</p>
+          </div>
+        )
       )}
 
       {/* ─── Bottom Sheet: Add / Edit Order ─── */}
@@ -1449,31 +1564,26 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
                 <input type="text" value={customer.produit} onChange={(e) => setCustomer({ ...customer, produit: e.target.value })} placeholder="يُملأ تلقائياً" className={inputCls(false)} />
               </div>
 
-              <div>
-                <label className="block text-xs font-extrabold text-ink mb-1.5">سعر المنتج (دج)</label>
-                <input type="number" value={customer.product_price} onChange={(e) => setCustomer({ ...customer, product_price: e.target.value })} placeholder="0.00" dir="ltr" className={`${inputCls(montantInvalid)} no-spinner`} />
-                {montantInvalid && <p className="text-xs text-danger m-0 mt-1">سعر المنتج مطلوب</p>}
-                {selectedFee && (
-                  <div className="mt-1.5 grid grid-cols-2 gap-2">
-                    <div className="rounded-xl bg-lav/40 border border-purple/20 px-3 py-2">
-                      <span className="text-[10px] font-medium text-purple block">توصيل للمنزل</span>
-                      <span className="text-xs font-bold text-purple" dir="ltr">{selectedFee.tarif} دج</span>
-                    </div>
-                    <div className="rounded-xl bg-white border border-border px-3 py-2">
-                      <span className="text-[10px] font-medium text-subtle block">توصيل للمكتب</span>
-                      <span className="text-xs font-bold text-muted" dir="ltr">{selectedFee.tarif_stopdesk} دج</span>
-                    </div>
+              {selectedFee && (
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="rounded-xl bg-lav/40 border border-purple/20 px-3 py-2">
+                    <span className="text-[10px] font-medium text-purple block">توصيل للمنزل</span>
+                    <span className="text-xs font-bold text-purple" dir="ltr">{selectedFee.tarif} دج</span>
                   </div>
-                )}
-              </div>
+                  <div className="rounded-xl bg-white border border-border px-3 py-2">
+                    <span className="text-[10px] font-medium text-subtle block">توصيل للمكتب</span>
+                    <span className="text-xs font-bold text-muted" dir="ltr">{selectedFee.tarif_stopdesk} دج</span>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Price Summary */}
             <div className="mt-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 rounded-2xl bg-lav/60 border border-purple/15 px-4 py-3.5">
               <div>
                 <p className="text-xs font-medium text-ink">المبلغ المحصّل</p>
-                <p className="text-[10px] text-subtle mt-0.5" dir="ltr">
-                  {productPrice} × {productCount} + {deliveryFee} توصيل = {totalMontant} دج
+                <p className="text-[10px] text-subtle mt-0.5">
+                  مجموع المنتجات {itemsTotal} دج ({items.length} منتج) + {deliveryFee} توصيل = {totalMontant} دج
                 </p>
               </div>
               <span className="text-xl font-extrabold text-purple tabular-nums" dir="ltr">
@@ -1540,24 +1650,135 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
                             </span>
                           )}
                           {items.length > 1 && (
-                            <button type="button" onClick={() => removeItem(item.id)} className="w-5 h-5 rounded-full bg-danger/10 text-danger grid place-items-center hover:bg-danger/20 transition-colors">
-                              <X size={10} />
+                            <button type="button" onClick={() => removeItem(item.id)} className="w-6 h-6 rounded-full bg-danger/10 text-danger grid place-items-center hover:bg-danger/20 transition-colors" title="حذف المنتج" aria-label="حذف المنتج">
+                              <X size={11} />
                             </button>
                           )}
                         </div>
                       )}
 
-                      {/* Color + Size row */}
-                      <div className="flex gap-2 mt-2">
-                        {/* Color */}
-                        <div className="flex-1">
-                          <input type="text" value={item.color} onChange={(e) => updateItem(item.id, 'color', e.target.value)} placeholder="اللون" className="h-9 w-full border border-border rounded-lg px-3 outline-none focus:border-purple transition-all text-xs bg-white placeholder:text-muted" />
+                      {/* Pick from stock (add flow only) */}
+                      {!editingOrder && (
+                        <div className="mt-2">
+                          <select
+                            value={item.productId || ''}
+                            onChange={(e) => handleItemProduct(item.id, e.target.value)}
+                            className="h-9 w-full border border-border rounded-lg px-2 outline-none focus:border-purple focus:ring-2 focus:ring-purple/10 transition-all text-xs bg-white text-ink"
+                            aria-label="اختر منتجاً من المخزون"
+                          >
+                            <option value="">— اختيار منتج من المخزون —</option>
+                            {catalog.map(c => (
+                              <option key={c.id} value={c.id}>{c.name}</option>
+                            ))}
+                          </select>
+                          {catalog.length === 0 && (
+                            <p className="text-[10px] text-amber-600 m-0 mt-1">لا توجد منتجات في المخزون — أضفها من تبويب «المخزون».</p>
+                          )}
                         </div>
+                      )}
 
-                        {/* Size */}
-                        <div className="flex-1">
-                          <input type="text" value={item.size} onChange={(e) => updateItem(item.id, 'size', e.target.value)} placeholder="المقاس" className="h-9 w-full border border-border rounded-lg px-3 outline-none focus:border-purple transition-all text-xs bg-white placeholder:text-muted" />
+                      {picked ? (
+                        <>
+                          {/* Colour swatches — no codes, just colours */}
+                          <div className="mt-2">
+                            <span className="block text-[10px] font-bold text-subtle mb-1">اللون</span>
+                            {productColors(picked.variants).length === 0 ? (
+                              <span className="text-[10px] text-subtle">لا ألوان لهذا المنتج</span>
+                            ) : (
+                              <div className="flex flex-wrap gap-1.5">
+                                {productColors(picked.variants).map(color => {
+                                  const active = item.color === color
+                                  return (
+                                    <button
+                                      key={color}
+                                      type="button"
+                                      onClick={() => handleItemColor(item.id, color)}
+                                      aria-label="اختيار اللون"
+                                      aria-pressed={active}
+                                      className={`w-8 h-8 rounded-full transition-all ${
+                                        active
+                                          ? 'ring-2 ring-purple ring-offset-2'
+                                          : 'ring-1 ring-border7 hover:ring-purple/40'
+                                      }`}
+                                      style={{ background: color }}
+                                    />
+                                  )
+                                })}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Sizes with the quantity available in stock */}
+                          <div className="mt-2">
+                            <span className="block text-[10px] font-bold text-subtle mb-1">المقاس</span>
+                            {!item.color ? (
+                              <span className="text-[10px] text-subtle">اختر اللون أولاً</span>
+                            ) : productSizes(picked.variants, item.color).length === 0 ? (
+                              <span className="text-[10px] text-subtle">لا مقاسات لهذا اللون</span>
+                            ) : (
+                              <div className="flex flex-wrap gap-1.5">
+                                {productSizes(picked.variants, item.color).map(size => {
+                                  const qty = stockQty(picked, item.color, size)
+                                  const active = item.size === size
+                                  return (
+                                    <button
+                                      key={size}
+                                      type="button"
+                                      onClick={() => updateItem(item.id, 'size', size)}
+                                      disabled={qty <= 0}
+                                      className={`h-8 px-2.5 rounded-lg border text-[11px] font-bold transition-all ${
+                                        active
+                                          ? 'border-purple bg-lav text-purple'
+                                          : qty <= 0
+                                            ? 'border-border bg-soft text-subtle/50 line-through'
+                                            : 'border-border bg-white text-meta2 hover:border-purple/40'
+                                      }`}
+                                    >
+                                      {size}
+                                      <span className="mr-1 text-[9px] opacity-70" dir="ltr">({qty})</span>
+                                    </button>
+                                  )
+                                })}
+                              </div>
+                            )}
+                          </div>
+
+                          {item.color && item.size && (
+                            <p className={`text-[10px] font-bold mt-1.5 m-0 ${stockQty(picked, item.color, item.size) > 0 ? 'text-green-600' : 'text-danger'}`}>
+                              {stockQty(picked, item.color, item.size) > 0
+                                ? `سيُخصم من المخزون — المتوفر ${stockQty(picked, item.color, item.size)}`
+                                : 'هذا المقاس غير متوفر في المخزون'}
+                            </p>
+                          )}
+                        </>
+                      ) : (
+                        <div className="flex gap-2 mt-2">
+                          {/* Free-text fallback for products not in the catalog */}
+                          <div className="flex-1">
+                            <input type="text" value={item.color} onChange={(e) => updateItem(item.id, 'color', e.target.value)} placeholder="اللون" className="h-9 w-full border border-border rounded-lg px-3 outline-none focus:border-purple transition-all text-xs bg-white placeholder:text-muted" />
+                          </div>
+                          <div className="flex-1">
+                            <input type="text" value={item.size} onChange={(e) => updateItem(item.id, 'size', e.target.value)} placeholder="المقاس" className="h-9 w-full border border-border rounded-lg px-3 outline-none focus:border-purple transition-all text-xs bg-white placeholder:text-muted" />
+                          </div>
                         </div>
+                      )}
+
+                      {/* Per-product price — summed into the order total */}
+                      <div className="mt-2 flex items-center gap-2">
+                        <span className="shrink-0 text-[10px] font-bold text-subtle">السعر (دج)</span>
+                        <input
+                          type="number"
+                          min="0"
+                          value={item.price ?? ''}
+                          onChange={(e) => updateItem(item.id, 'price', e.target.value)}
+                          placeholder={String(defaultUnitPrice || 0)}
+                          dir="ltr"
+                          className="no-spinner h-9 flex-1 min-w-0 border border-border rounded-lg px-3 outline-none focus:border-purple focus:ring-2 focus:ring-purple/10 transition-all text-xs bg-white"
+                          aria-label="سعر المنتج"
+                        />
+                        <span className="shrink-0 text-[10px] font-bold text-purple" dir="ltr">
+                          = {unitPriceOf(item)} دج
+                        </span>
                       </div>
                     </div>
                   </div>
@@ -1571,9 +1792,10 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
 
           {/* Sticky submit row */}
           <div className="sticky bottom-0 bg-white border-t border-border pt-3.5 pb-4 z-10 shadow-bottom">
-            <p className="text-xs text-subtle text-center mb-2 m-0">
-              يُرسل كطلب واحد
-            </p>
+            <div className="flex items-center justify-between mb-2 px-1">
+              <span className="text-[11px] text-subtle">{items.length} منتج · يُرسل كطلب واحد</span>
+              <span className="text-[12px] font-extrabold text-purple" dir="ltr">{totalMontant} دج</span>
+            </div>
             <button type="submit" disabled={saving} className="w-full h-[48px] border-0 rounded-2xl bg-purple text-white font-extrabold hover:bg-purple-2 transition-all disabled:opacity-60 disabled:cursor-not-allowed text-[15px] shadow-lg shadow-purple/25 flex items-center justify-center gap-2">
               {saving && <span className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />}
               {saving ? 'جاري الإرسال...' : editingOrder ? 'حفظ التعديلات' : 'حفظ وإرسال'}

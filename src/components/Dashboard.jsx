@@ -1,10 +1,12 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
-import { LayoutGrid, ClipboardList, Truck } from 'lucide-react'
+import { LayoutGrid, ClipboardList, Truck, Package } from 'lucide-react'
 import StatsCards from './StatsCards'
 import OrdersSection from './OrdersSection'
 import FeesSection from './FeesSection'
+import ProductsSection from './ProductsSection'
 import InstallPrompt from './InstallPrompt'
+
 import Toast from './Toast'
 
 export default function Dashboard({ session, onLogout }) {
@@ -38,6 +40,7 @@ export default function Dashboard({ session, onLogout }) {
   const tabs = [
     { id: 'home', label: 'الرئيسية', icon: LayoutGrid },
     { id: 'orders', label: 'الطلبات', icon: ClipboardList },
+    { id: 'stock', label: 'المخزون', icon: Package },
     { id: 'fees', label: 'الأسعار', icon: Truck },
   ]
 
@@ -73,7 +76,16 @@ export default function Dashboard({ session, onLogout }) {
           </>
         )}
 
-        {/* Fees Tab */}
+        {/* Stock Tab */}
+        {activeTab === 'stock' && (
+          <>
+            <h1 className="text-[27px] font-extrabold tracking-tight mt-3 mb-0.5">المخزون</h1>
+            <div className="text-[15px] text-subtle2 mb-6">أضف منتجاتك بألوانها ومقاساتها وكمياتها.</div>
+            <ProductsSection showToast={showToast} />
+          </>
+        )}
+
+      {/* Fees Tab */}
         {activeTab === 'fees' && (
           <>
             <h1 className="text-[27px] font-extrabold tracking-tight mt-3 mb-0.5">أسعار التوصيل</h1>

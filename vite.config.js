@@ -103,10 +103,18 @@ function r2Plugin() {
       server.middlewares.use('/api/upload', (req, res, next) => {
         if (req.method !== 'POST') return next()
         readBody(req).then(body => {
+          if (body.length === 0) {
+            res.statusCode = 400
+            res.setHeader('Content-Type', 'application/json')
+            return res.end(JSON.stringify({ error: 'Empty body' }))
+          }
           const ct = req.headers['content-type'] || 'application/octet-stream'
           const cd = req.headers['content-disposition'] || ''
           const m = cd.match(/filename=\"?([^\";\\n]+)\"?/)
-          const fname = m ? m[1] : 'upload'
+          // The browser sends the name as ?filename= (plus X-Filename); the
+          // production handler reads the same sources, so dev keys match prod.
+          const queryName = new URL(req.url, 'http://localhost').searchParams.get('filename')
+          const fname = queryName || req.headers['x-filename'] || (m ? m[1] : 'upload')
           const ext = fname.split('.').pop() || 'bin'
           const key = `products/${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`
 

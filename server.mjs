@@ -14,6 +14,8 @@ const r2 = new S3Client({
 
 const BUCKET = process.env.R2_BUCKET
 const PUBLIC_URL = process.env.R2_PUBLIC_URL
+const ECOTRACK_TOKEN = process.env.ECOTRACK_TOKEN
+const ECOTRACK_BASE_URL = (process.env.ECOTRACK_BASE_URL || '').replace(/\/+$/, '')
 
 // ECOTRACK stop desks — GET /api/v1/get/desks returns every active desk in the
 // country as { my_desk: {...}, other_desks: [...] }, so the caller filters by wilaya.
@@ -106,10 +108,12 @@ const server = createServer(async (req, res) => {
     // POST /api/upload — raw body straight to R2
     if (req.method === 'POST' && req.url === '/api/upload') {
       const body = await readBody(req)
+      if (body.length === 0) { sendJSON(res, 400, { error: 'Empty body' }); return }
       const ct = req.headers['content-type'] || 'application/octet-stream'
       const cd = req.headers['content-disposition'] || ''
       const match = cd.match(/filename="?([^";\n]+)"?/)
-      const fname = match ? match[1] : 'upload'
+      const queryName = new URL(req.url, 'http://localhost').searchParams.get('filename')
+      const fname = queryName || req.headers['x-filename'] || (match ? match[1] : 'upload')
       const ext = fname.split('.').pop() || 'bin'
       const key = `products/${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`
 
