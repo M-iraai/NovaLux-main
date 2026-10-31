@@ -235,7 +235,7 @@ export default function FeesSection() {
                     ) : (
                       <>
                         <Copy size={16} />
-                        نسخ الأسعار لل.clipboard
+                        نسخ الأسعار
                       </>
                     )}
                   </button>
