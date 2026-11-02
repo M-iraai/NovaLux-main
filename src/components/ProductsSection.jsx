@@ -280,9 +280,22 @@ export default function ProductsSection({ showToast }) {
       .map(v => ({
         color: v.color || null,
         size: String(v.size || '').trim() || null,
-        quantity: v.quantity === '' ? 0 : Number(v.quantity) || 0,
+        // Quantity is a count — never store a negative or NaN.
+        quantity: Math.max(0, v.quantity === '' ? 0 : Number(v.quantity) || 0),
       }))
       .filter(v => v.color)
+
+    // Two rows with the same colour + size would both be hit by one order,
+    // so the same unit would be deducted twice — keep the catalog unambiguous.
+    const seen = new Set()
+    for (const v of variants) {
+      const key = `${v.color}|${v.size || ''}`
+      if (seen.has(key)) {
+        showToast(`مقاس مكرر لهذا اللون (${v.size || 'بدون مقاس'}) — احذف النسخة الزائدة قبل الحفظ`)
+        return
+      }
+      seen.add(key)
+    }
 
     const values = {
       name: form.name.trim(),

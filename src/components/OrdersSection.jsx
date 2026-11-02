@@ -22,38 +22,31 @@ function getImageUrl(storedValue) {
   return `/api/image?key=${encodeURIComponent(storedValue)}`
 }
 
-const DAY_BOUNDARY_HOUR = 15 // day splits at 3 PM
-
-// Returns the calendar date of the 3PM→3PM business day's END.
-// e.g. an order at 10 AM Sep 1 belongs to the business day ending Sep 1,
-// and an order at 4 PM Sep 1 belongs to the business day ending Sep 2.
-function getBusinessDayDate(date) {
-  const shifted = new Date(date.getTime() - DAY_BOUNDARY_HOUR * 60 * 60 * 1000)
-  const end = new Date(shifted.getFullYear(), shifted.getMonth(), shifted.getDate() + 1)
-  return end
+// Day groups split at midnight: every order belongs to its own calendar day,
+// so an order at 00:30 is grouped with the day that just started.
+function getDayDate(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate())
 }
 
-function getBusinessDayKey(date) {
-  return getBusinessDayDate(date).toDateString()
+function getDayKey(date) {
+  return getDayDate(date).toDateString()
 }
 
 function groupOrdersByDay(orders) {
   const groups = {}
   orders.forEach(order => {
     const d = new Date(order.created_at)
-    const key = getBusinessDayKey(d)
-    if (!groups[key]) groups[key] = { date: getBusinessDayDate(d), orders: [] }
+    const key = getDayKey(d)
+    if (!groups[key]) groups[key] = { date: getDayDate(d), orders: [] }
     groups[key].orders.push(order)
   })
   return Object.values(groups).sort((a, b) => b.date - a.date)
 }
 
 function getDayLabel(date) {
-  const todayKey = getBusinessDayKey(new Date())
-  const targetKey = getBusinessDayKey(date)
-  if (todayKey === targetKey) return 'اليوم'
-  const todayDate = getBusinessDayDate(new Date())
-  const targetDate = getBusinessDayDate(date)
+  const todayDate = getDayDate(new Date())
+  const targetDate = getDayDate(date)
+  if (todayDate.getTime() === targetDate.getTime()) return 'اليوم'
   const diffDays = Math.round((todayDate - targetDate) / (1000 * 60 * 60 * 24))
   if (diffDays === 1) return 'أمس'
   if (diffDays > 1 && diffDays < 7) return `منذ ${diffDays} أيام`
@@ -320,7 +313,9 @@ const formatEcotrackErrors = (data) => {
 // Subtract ordered quantities from catalog stock using stock manager
 // @see stockManager.subtractStock
 function subtractOrderStock(products, catalog, showToast) {
-  stockManager.subtractStock(products, catalog, showToast)
+  // Return the promise — awaiting this wrapper must actually wait for the
+  // catalog write, otherwise the UI refreshes before stock has changed.
+  return stockManager.subtractStock(products, catalog, showToast)
 }
 
 // One call to our /api/orders proxy → { ok, data, tracking, error }
@@ -588,6 +583,24 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
     return Number(variant?.quantity) || 0
   }
 
+  // Colours that still have stock in at least one size. Once a colour runs
+  // out it disappears from the picker; the colour already chosen stays visible
+  // so editing an order never silently loses its selection.
+  const availableColors = (product, selectedColor) => {
+    const variants = Array.isArray(product?.variants) ? product.variants : []
+    return productColors(variants).filter(color =>
+      color === selectedColor ||
+      variants.some(v => v?.color === color && (Number(v?.quantity) || 0) > 0)
+    )
+  }
+
+  // Sizes with stock left — a sold-out size is not offered at all. The size
+  // already chosen stays visible so editing an order keeps its selection.
+  const availableSizes = (product, color, selectedSize) =>
+    productSizes(product?.variants, color).filter(size =>
+      size === selectedSize || stockQty(product, color, size) > 0
+    )
+
   // Link an order item to a stock product: resets colour/size, borrows the
   // catalog photo and pre-fills the empty ECOTRACK name/price fields.
   const handleItemProduct = (itemId, productId) => {
@@ -646,6 +659,17 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
     setTriedSubmit(true)
     if (!customer.customer_name.trim() || !customer.phone.trim()) return
 
+    // A size is mandatory on every product — an order must never be placed
+    // without one, so the catalog always knows which variant to deduct.
+    const missingSizeIndex = items.findIndex(it => !String(it.size || '').trim())
+    if (missingSizeIndex !== -1) {
+      const it = items[missingSizeIndex]
+      showToast(it.productId && !it.color
+        ? `اختر اللون والمقاس للمنتج رقم ${missingSizeIndex + 1}`
+        : `اختر المقاس للمنتج رقم ${missingSizeIndex + 1}`)
+      return
+    }
+
     // Never sell more than a linked catalog product actually has (add flow
     // only — editing an order must not re-check stock it already consumed).
     if (!editingOrder) {
@@ -655,9 +679,15 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
         const key = `${it.productId}|${it.color}|${it.size}`
         requested.set(key, (requested.get(key) || 0) + 1)
       }
+      // Read stock fresh: the sheet may have been open for a while, and the
+      // check must reflect what is actually left in the catalog right now.
+      const { data: fresh } = requested.size
+        ? await supabase.from('products').select('*')
+        : { data: null }
+      const liveCatalog = Array.isArray(fresh) ? fresh : catalog
       for (const [key, count] of requested) {
         const [pid, color, size] = key.split('|')
-        const product = productById(pid)
+        const product = liveCatalog.find(c => String(c.id) === String(pid))
         const available = stockQty(product, color, size)
         if (count > available) {
           showToast(`الكمية المطلوبة من "${product?.name || 'منتج'}" — ${size} أكبر من المخزون (${available})`)
@@ -778,6 +808,15 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
         // Both sides carry the new data — only now replaced/removed photos go
         for (const key of dropKeys) await deleteFromR2(key)
 
+        // ─── Stock follows the edit ──────────────────────────────────────
+        // Changing the colour/size (or swapping products) moves inventory in
+        // one write per product: what the order no longer holds goes back to
+        // the catalog, what it now holds is taken out, and unchanged pairs
+        // cancel out. syncStock reads the current rows itself, so the write
+        // never overwrites a quantity changed in the stock manager meanwhile.
+        await stockManager.syncStock(orderProducts(old), products, catalog, showToast)
+        await fetchCatalog()
+
         showToast(old.tracking
           ? 'تم تعديل الطلب في Supabase و ECOTRACK'
           : 'تم الحفظ محلياً — تنبيه: الطلب غير موجود في ECOTRACK (بدون رقم تتبع)')
@@ -863,7 +902,7 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
 
         // Subtract ordered quantities from catalog inventory (non-fatal on failure)
         await subtractOrderStock(products, catalog, showToast)
-        fetchCatalog()
+        await fetchCatalog()
 
         showToast(`تمت إضافة الطلب (${products.length} منتج) · ${eco.tracking}`)
       }
@@ -879,7 +918,7 @@ export default function OrdersSection({ orders, compact, full, onRefresh, showTo
   // Add back the exact quantities an order took from the catalog using stock manager
 // @see stockManager.addStock
 function addBackOrderStock(products, catalog, showToast) {
-  stockManager.addStock(products, catalog, showToast)
+  return stockManager.addStock(products, catalog, showToast)
   }
 
 
@@ -908,22 +947,7 @@ function addBackOrderStock(products, catalog, showToast) {
             else remoteError = eco.error
           }
 
-          // ─── Stock roll-back happens BEFORE the delete, not after. ─────────
-          // • Not confirmed (new / pending) → the products are still available,
-          //   so the quantities they locked during the add go back: +1 each
-          //   colour/size. They are NOT added to the catalog again (the
-          //   catalog is the master list you manage in مدير المنتجات, and
-          //   deleting an order never invents new products).
-          // • Confirmed → the customer already received the goods; delete the
-          //   order but leave stock untouched so your sellable inventory is
-          //   not inflated.
-          // ────────────────────────────────────────────────────────────────
           const removedProducts = orderProducts(order)
-          if (!order.confirmed) {
-            const { data } = await supabase.from('products').select('*')
-            const catalog = Array.isArray(data) ? data : []
-            await addBackOrderStock(removedProducts, catalog, showToast)
-          }
 
           const { error } = await supabase.from('orders').delete().eq('id', order.id)
           if (error) {
@@ -932,6 +956,13 @@ function addBackOrderStock(products, catalog, showToast) {
               : `تعذر الحذف من Supabase: ${error.message}${remoteError ? ` — وتعذر الحذف من ECOTRACK (${remoteError})` : ''}`)
             return
           }
+
+          // The order is gone → the units it held go back to the catalog.
+          // Restoring only AFTER a successful delete keeps stock truthful: an
+          // order that still exists must keep its units deducted. Confirmed
+          // orders are included because stock is deducted for every order at
+          // creation, and this app has no separate "delivered" state.
+          await addBackOrderStock(removedProducts, [], showToast)
 
           await deleteOrderImages(order)
           showToast(remoteDeleted
@@ -983,6 +1014,13 @@ function addBackOrderStock(products, catalog, showToast) {
             else {
               deleted = toDelete.length
               for (const o of toDelete) await deleteOrderImages(o)
+              // Same rule as deleting a single order: everything deleted in
+              // this batch returns its units (counts summed per variant).
+              await addBackOrderStock(
+                toDelete.flatMap(o => orderProducts(o)),
+                [],
+                showToast
+              )
             }
           }
 
@@ -1684,9 +1722,11 @@ function addBackOrderStock(products, catalog, showToast) {
                             <span className="block text-[10px] font-bold text-subtle mb-1">اللون</span>
                             {productColors(picked.variants).length === 0 ? (
                               <span className="text-[10px] text-subtle">لا ألوان لهذا المنتج</span>
+                            ) : availableColors(picked, item.color).length === 0 ? (
+                              <span className="text-[10px] text-subtle">لا ألوان متوفرة في المخزون</span>
                             ) : (
                               <div className="flex flex-wrap gap-1.5">
-                                {productColors(picked.variants).map(color => {
+                                {availableColors(picked, item.color).map(color => {
                                   const active = item.color === color
                                   return (
                                     <button
@@ -1715,9 +1755,11 @@ function addBackOrderStock(products, catalog, showToast) {
                               <span className="text-[10px] text-subtle">اختر اللون أولاً</span>
                             ) : productSizes(picked.variants, item.color).length === 0 ? (
                               <span className="text-[10px] text-subtle">لا مقاسات لهذا اللون</span>
+                            ) : availableSizes(picked, item.color, item.size).length === 0 ? (
+                              <span className="text-[10px] text-subtle">لا مقاسات متوفرة في المخزون</span>
                             ) : (
                               <div className="flex flex-wrap gap-1.5">
-                                {productSizes(picked.variants, item.color).map(size => {
+                                {availableSizes(picked, item.color, item.size).map(size => {
                                   const qty = stockQty(picked, item.color, size)
                                   const active = item.size === size
                                   return (
@@ -1743,6 +1785,10 @@ function addBackOrderStock(products, catalog, showToast) {
                             )}
                           </div>
 
+                          {triedSubmit && !String(item.size || '').trim() && (
+                            <p className="text-[10px] font-bold text-danger mt-1 m-0">اختر المقاس — مطلوب لإتمام الطلب</p>
+                          )}
+
                           {item.color && item.size && (
                             <p className={`text-[10px] font-bold mt-1.5 m-0 ${stockQty(picked, item.color, item.size) > 0 ? 'text-green-600' : 'text-danger'}`}>
                               {stockQty(picked, item.color, item.size) > 0
@@ -1758,7 +1804,7 @@ function addBackOrderStock(products, catalog, showToast) {
                             <input type="text" value={item.color} onChange={(e) => updateItem(item.id, 'color', e.target.value)} placeholder="اللون" className="h-9 w-full border border-border rounded-lg px-3 outline-none focus:border-purple transition-all text-xs bg-white placeholder:text-muted" />
                           </div>
                           <div className="flex-1">
-                            <input type="text" value={item.size} onChange={(e) => updateItem(item.id, 'size', e.target.value)} placeholder="المقاس" className="h-9 w-full border border-border rounded-lg px-3 outline-none focus:border-purple transition-all text-xs bg-white placeholder:text-muted" />
+                            <input type="text" value={item.size} onChange={(e) => updateItem(item.id, 'size', e.target.value)} placeholder="المقاس (مطلوب)" className={`h-9 w-full border rounded-lg px-3 outline-none transition-all text-xs bg-white placeholder:text-muted ${triedSubmit && !String(item.size || '').trim() ? 'border-danger focus:border-danger' : 'border-border focus:border-purple'}`} />
                           </div>
                         </div>
                       )}
